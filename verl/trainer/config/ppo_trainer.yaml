@@ -255,6 +255,9 @@ algorithm:
     log_group_stats: True # 是否将分组结构统计写入 TensorBoard 的 gigpo_group/ 面板（包括组数、组大小分布、单成员/多成员比例、退化率、全成功/全失败比例）。与 TGSA 无关，纯 GiGPO 也可用。
     eps_deg: 0.01 # 退化组判定阈值：episode 组的回报标准差 σ^R_group ≤ 此值时视为退化（建议 ~0.01）
     success_thresh: 0.0 # 区分退化组为"全成功"或"全失败"的回报均值阈值：> thresh 为全成功，≤ thresh 为全失败。0/1 奖励时用 0.0。
+  opd: # 纯 OPD 消融基线（ROLL 标准）：advantage = -coef·KL(pi_theta||pi_T)，无环境奖励/门控/critic。algorithm.adv_estimator=opd 时生效。教师复用 algorithm.tgsa.teacher config（与 TGSA 共用同一教师服务，便于公平对比）。
+    kl_coef: 1.0 # KL 蒸馏系数（对应 ROLL opd_kl_coef，默认 1.0）
+    kl_penalty: "k3" # KL 估计形式，与 ROLL 一致；可选 "kl"(k1)/"abs"/"mse"
   tgsa: # TGSA-GRPO：在 GiGPO 基础上引入教师模型的步级优势调制
     enabled: False # 总开关。False 时教师服务器永远不被调用，走原始 GiGPO 逻辑
     # 优势公式：A_total = A^E + lambda*L_T*|A^E| + mu*1_deg*L_T

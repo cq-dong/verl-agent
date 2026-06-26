@@ -94,6 +94,7 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     GRPO_PASSK = "grpo_passk"
     GiGPO = 'gigpo'
+    OPD = "opd"  # 纯 OPD 消融基线(ROLL 标准):adv=-coef·KL,无环境奖励/门控/critic
 
 
 @dataclass
@@ -385,6 +386,38 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.OPD:
+        # 纯 OPD 消融基线(ROLL 标准):advantage = -coef·KL(pi_theta||pi_T),
+        # 逐 token 乘 response_mask。无环境奖励、无门控(全轨迹无条件蒸馏)、无 critic。
+        # 忠实复刻 ROLL functionals.py:1149 (adv=-total_weighted_kld) + :1180 (mask)。
+        # 教师教师 log_prob 由 fit 里的 _teacher_future 写入 batch['teacher_log_prob']。
+        # 关键:OPD 分支不调 GiGPO 的 episode/step 组归一化(adv 逐轨迹独立,与组无关)。
+        if "teacher_log_prob" not in data.batch:
+            raise ValueError(
+                "OPD estimator requires batch['teacher_log_prob']; ensure the teacher "
+                "scoring future ran (adv_estimator=opd + teacher server configured).")
+        from gigpo.opd import compute_opd_advantage
+        _ocfg = kwargs.get("opd_config") or {}
+        _opd_stats: dict = {}
+        _adv, _ret = compute_opd_advantage(
+            old_log_probs=data.batch["old_log_probs"],
+            teacher_log_prob=data.batch["teacher_log_prob"],
+            response_mask=data.batch["response_mask"],
+            response_length=data.batch["response_mask"].size(1),
+            kl_coef=float(_ocfg.get("kl_coef", 1.0)),
+            kl_penalty=str(_ocfg.get("kl_penalty", "k3")),
+            out_stats=_opd_stats,
+        )
+        data.batch["advantages"] = _adv
+        data.batch["returns"] = _ret
+        # 侧信道统计量:opd/* 面板(教师健康 tgsa_teacher/*、KL 信号 tgsa_signal/delta_*
+        # 已由 TGSA stats logger 在教师评分时记录)。logger 未启用时 record 为 no-op。
+        if _opd_stats:
+            try:
+                from gigpo.tgsa_stats import TGSAStatsLogger
+                TGSAStatsLogger.get().record_scalars(_opd_stats)
+            except Exception:  # noqa: BLE001 - 统计不得崩溃训练步
+                pass
     else:
         raise NotImplementedError
     return data
@@ -474,6 +507,12 @@ class RayPPOTrainer:
         self.teacher_client = None  # driver-side; lazily built in fit()
         self._tgsa_executor = None  # single-thread pool to overlap teacher HTTP with Ray calls
 
+        # 纯 OPD 消融基线(ROLL 标准):adv_estimator=opd 时启用。advantage=-coef·KL,
+        # 无环境奖励/门控/critic。教师复用 algorithm.tgsa.teacher config(TGSA 与 OPD
+        # 共用同一教师服务,便于公平对比)。opd_enabled=True 时也需构建教师 client
+        # 与教师评分 future(见 fit 的 tgsa_enabled or opd_enabled 放宽)。
+        self.opd_enabled = (config.algorithm.adv_estimator == AdvantageEstimator.OPD)
+
         # GiGPO group-structure stats (independent of TGSA): record the per-group
         # panel (group counts, size distribution, degeneration rate, all-success/
         # all-fail split) so plain GiGPO can diagnose anchor-overlap sparsity
@@ -497,7 +536,8 @@ class RayPPOTrainer:
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-            AdvantageEstimator.GiGPO
+            AdvantageEstimator.GiGPO,
+            AdvantageEstimator.OPD,  # 纯 OPD:无 critic(对齐 ROLL critic_warmup=0)
         ]:
             self.use_critic = False
         else:
@@ -1105,14 +1145,21 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
 
-        # TGSA: build the driver-side teacher HTTP client (sglang server) and a
-        # single-worker thread pool so teacher scoring overlaps with the Ray
-        # reward/old_log_prob/ref calls inside the loop.
-        if self.tgsa_enabled:
+        # TGSA / 纯 OPD: 构建 driver 端教师 HTTP client(sglang server)+ 单线程池,
+        # 使教师评分与循环内 reward/old_log_prob/ref 等 Ray 调用重叠(I/O 隐藏)。
+        # 纯 OPD(opd_enabled)同样需要教师前向(adv=-coef·KL 依赖 teacher_log_prob),
+        # 故构建条件放宽为 tgsa_enabled OR opd_enabled。
+        if self.tgsa_enabled or self.opd_enabled:
             from concurrent.futures import ThreadPoolExecutor
             from gigpo.teacher_client import SGLangTeacherClient
-            tcfg = self.tgsa_config
+            # 教师 config 复用 algorithm.tgsa.teacher(TGSA 与纯 OPD 共用同一教师服务,
+            # 便于公平对比)。纯 OPD 时 tgsa_config 可能为 None,从 self.config 兜底读。
+            tcfg = self.tgsa_config or {}
             teacher_cfg = tcfg.get("teacher", {}) or {}
+            if not teacher_cfg:
+                # 纯 OPD 且 tgsa_config 为空时,从 algorithm.tgsa.teacher 兜底
+                _t_cfg_full = OmegaConf.select(self.config, "algorithm.tgsa", default=None)
+                teacher_cfg = (_t_cfg_full.get("teacher", {}) or {}) if _t_cfg_full is not None else {}
             margin_cfg = tcfg.get("margin", {}) or {}
             top_lp = int(margin_cfg.get("topk", 2)) if margin_cfg.get("enabled", False) else 0
             self.teacher_client = SGLangTeacherClient(
@@ -1124,15 +1171,13 @@ class RayPPOTrainer:
             )
             self._tgsa_executor = ThreadPoolExecutor(max_workers=1)
             if not self.teacher_client.health_check():
-                print(f"[TGSA] WARNING: teacher server at {teacher_cfg.get('base_url')} did not "
+                print(f"[TGSA/OPD] WARNING: teacher server at {teacher_cfg.get('base_url')} did not "
                       f"respond to /health; the first teacher call will fail.")
 
-        # Side-channel tensorboard logger: writes tgsa_* / gigpo_group_* curves
-        # to the SAME $TENSORBOARD_DIR verl uses, so they merge into one view.
-        # Enabled once here when EITHER TGSA OR plain-GiGPO group stats are on.
-        # Disabled by default; teacher_client / core_gigpo / tgsa buffer stats,
-        # flushed once per step below. Degrades gracefully if tensorboard absent.
-        if self.tgsa_enabled or self._gigpo_log_groups:
+        # 侧信道 tensorboard logger: 把 tgsa_* / gigpo_group_* / opd_* 曲线写进 verl
+        # 同一个 $TENSORBOARD_DIR,自动并入同一视图。TGSA、纯 GiGPO 分组统计、纯 OPD
+        # 任一开启时启用一次。默认禁用;缺 tensorboard 时优雅降级(告警+禁用,不崩训练)。
+        if self.tgsa_enabled or self._gigpo_log_groups or self.opd_enabled:
             from gigpo.tgsa_stats import TGSAStatsLogger
             TGSAStatsLogger.get().enable()
 
@@ -1231,8 +1276,11 @@ class RayPPOTrainer:
                     # below; the future is joined right before compute_advantage.
                     # TGSA only modulates the GiGPO advantage, so skip for other
                     # estimators (avoids wasted teacher HTTP when mis-configured).
+                    # 纯 OPD(opd_enabled)同样需要教师 log_prob(adv=-coef·KL),故也起
+                    # 教师评分 future(教师 client 已在 fit 开头构建)。
                     _teacher_future = None
-                    if self.tgsa_enabled and self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
+                    if (self.tgsa_enabled and self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO) \
+                            or self.opd_enabled:
                         _teacher_future = self._tgsa_executor.submit(
                             self._score_teacher,
                             batch.batch["input_ids"],
@@ -1360,14 +1408,16 @@ class RayPPOTrainer:
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
                             tgsa_config=self.tgsa_config,
                             gigpo_config=dict(self.config.algorithm.gigpo),
+                            # 纯 OPD 配置(adv_estimator=opd 时由 compute_advantage 的 OPD 分支读取)
+                            opd_config=dict(self.config.algorithm.opd),
                         )
 
                         # Flush the side-channel stats buffered during teacher
                         # scoring + compute_advantage to tensorboard, on the true
-                        # global-step axis. Runs for TGSA OR plain-GiGPO group
-                        # stats; no-op otherwise (logger stays disabled). Lands
+                        # global-step axis. Runs for TGSA OR plain-GiGPO group stats
+                        # OR 纯 OPD; no-op otherwise (logger stays disabled). Lands
                         # before the critic/actor updates of this step.
-                        if self.tgsa_enabled or self._gigpo_log_groups:
+                        if self.tgsa_enabled or self._gigpo_log_groups or self.opd_enabled:
                             try:
                                 from gigpo.tgsa_stats import TGSAStatsLogger
                                 TGSAStatsLogger.get().flush(int(self.global_steps))

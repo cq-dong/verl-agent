@@ -21,18 +21,36 @@ export TENSORBOARD_DIR="./logs/${project_name}/${experiment_name}"
 # Raise the per-user thread/process limit (RLIMIT_NPROC). With 8 GPUs verl
 # spawns 8 colocated GPU worker processes (1 per GPU, each holding
 # actor+rollout+ref+critic), and vLLM rollout processes are thread-heavy
-# (hundreds of threads each). Combined with ~144 AlfWorld env worker processes,
-# the default `ulimit -u` (often 4096–65535 in containers) gets exhausted and
-# you get: "pthread_create failed: Resource temporarily unavailable" /
-# "thread: Resource temporarily unavailable [system:11]" -> SIGABRT, which is
-# why 4 GPUs run fine but 8 GPUs crash during init_workers()/ref policy init.
-# This is EAGAIN on thread creation, NOT a GPU-memory OOM.
-# `ulimit -u unlimited` may fail if the hard limit is capped; fall back to a
-# large number. Requires the host/kernel limits (kernel.threads-max,
-# vm.max_map_count) to be high enough — set those via sysctl as root if needed.
-ulimit -u unlimited 2>/dev/null || ulimit -u 262144 2>/dev/null || true
+# (hundreds of threads each). Combined with ~160 AlfWorld env worker processes,
+# the per-user thread budget gets exhausted and you get:
+#   "pthread_create failed: Resource temporarily unavailable"
+#   "thread: Resource temporarily unavailable [system:11]"  -> SIGABRT
+#   "<jemalloc>: arena 0 background thread creation failed (11)"
+# This is EAGAIN on thread creation, NOT a GPU-memory OOM. It is why 4 GPUs run
+# fine but 8 GPUs crash during init_workers()/ref policy init.
+# `ulimit -u unlimited` only works up to the HARD limit; on this host the hard
+# limit is 102400 and non-root can't raise it, so ulimit alone is insufficient —
+# see the OMP/MKL/TORCH thread caps below, which is the real fix without root.
+ulimit -u unlimited 2>/dev/null || true
 echo "[DEBUG] ulimit -u (max user processes/threads): $(ulimit -u)"
 echo "[DEBUG] ulimit -n (open files): $(ulimit -n)"
+
+# Cap per-process CPU thread pools — THE key fix for the thread explosion.
+# PyTorch/OpenMP default to one intra-op thread per CPU (here nproc=160), so
+# EVERY Ray worker process (160+ AlfworldWorker + 8 GPU WorkerDict) that imports
+# torch spawns ~160 threads -> 160 procs * 160 = ~25600 threads from env workers
+# alone, plus vLLM's hundreds-per-process, which blows past the 102400 per-user
+# NPROC limit on 8 GPUs. GPU training is GPU-bound, so large CPU thread pools
+# are pure waste here. Capping to 1 cuts per-process threads ~160x.
+# Override by exporting these before running (e.g. OMP_NUM_THREADS=4).
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
+export TORCH_NUM_THREADS=${TORCH_NUM_THREADS:-1}
+# jemalloc (used by torch on this box) spawns background threads per arena;
+# disable them to avoid extra pthread_create pressure at the NPROC limit.
+export MALLOC_CONF=${MALLOC_CONF:-"background_thread:false,metadata_thp:auto"}
+echo "[DEBUG] OMP_NUM_THREADS=$OMP_NUM_THREADS MKL_NUM_THREADS=$MKL_NUM_THREADS TORCH_NUM_THREADS=$TORCH_NUM_THREADS"
 
 # Extend Ray worker registration timeout to handle slow AlfWorld env startup.
 # Each AlfworldWorker process imports torch/torchvision/alfworld and loads
