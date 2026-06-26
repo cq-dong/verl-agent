@@ -343,6 +343,27 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.GiGPO:
+        # TGSA: if a tgsa_config with enabled=True is passed and teacher log-probs
+        # are attached to the batch, compute_gigpo_outcome_advantage REPLACES the
+        # joint advantage (A^E + w*A^S) with the teacher-guided A_total. When TGSA
+        # is off (no tgsa_config / not enabled), all teacher args are None and the
+        # original GiGPO behavior is preserved.
+        tgsa_cfg = kwargs.get("tgsa_config")
+        tgsa_on = bool(tgsa_cfg is not None and tgsa_cfg.get("enabled", False))
+        if tgsa_on:
+            teacher_log_prob = data.batch["teacher_log_prob"]
+            old_log_probs = data.batch["old_log_probs"]
+            margin_on = bool(tgsa_cfg.get("margin", {}) and tgsa_cfg.get("margin", {}).get("enabled", False))
+            teacher_top2 = data.batch["teacher_top2_logprob"] if margin_on else None
+        else:
+            teacher_log_prob = old_log_probs = teacher_top2 = None
+
+        # GiGPO group-structure stats (independent of TGSA): enabled by the
+        # gigpo.log_group_stats config so plain GiGPO can see the grouping
+        # panel without a teacher. Falls back to defaults if gigpo_config absent.
+        _gcfg = kwargs.get("gigpo_config") or {}
+        _log_group_stats = bool(_gcfg.get("log_group_stats", False))
+
         advantages, returns = core_gigpo.compute_gigpo_outcome_advantage(
             token_level_rewards=data.batch['token_level_rewards'], # for episode group reward computing
             step_rewards=data.batch['step_rewards'], # for step group reward computing
@@ -354,6 +375,13 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             mode=gigpo_mode,
             enable_similarity=gigpo_enable_similarity,
             similarity_thresh=gigpo_similarity_thresh,
+            log_group_stats=_log_group_stats,
+            gigpo_eps_deg=float(_gcfg.get("eps_deg", 0.01)),
+            gigpo_success_thresh=float(_gcfg.get("success_thresh", 0.0)),
+            teacher_log_prob=teacher_log_prob,
+            old_log_probs=old_log_probs,
+            teacher_top2_logprob=teacher_top2,
+            tgsa_config=tgsa_cfg,
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
@@ -436,6 +464,24 @@ class RayPPOTrainer:
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get('lora_rank', 0) > 0
+
+        # TGSA-GRPO: teacher-guided step-level advantage (idea.md). Opt-in via
+        # algorithm.tgsa. The teacher is an EXTERNAL sglang HTTP service, NOT a
+        # verl Ray worker, so this does NOT touch Role/resource-pool wiring.
+        _tgsa_cfg = OmegaConf.select(self.config, "algorithm.tgsa", default=None)
+        self.tgsa_enabled = bool(_tgsa_cfg is not None and _tgsa_cfg.get("enabled", False))
+        self.tgsa_config = _tgsa_cfg
+        self.teacher_client = None  # driver-side; lazily built in fit()
+        self._tgsa_executor = None  # single-thread pool to overlap teacher HTTP with Ray calls
+
+        # GiGPO group-structure stats (independent of TGSA): record the per-group
+        # panel (group counts, size distribution, degeneration rate, all-success/
+        # all-fail split) so plain GiGPO can diagnose anchor-overlap sparsity
+        # without a teacher. The side-channel logger is shared with TGSA.
+        self._gigpo_log_groups = bool(
+            config.algorithm.adv_estimator == AdvantageEstimator.GiGPO
+            and OmegaConf.select(self.config, "algorithm.gigpo.log_group_stats", default=False)
+        )
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -991,6 +1037,21 @@ class RayPPOTrainer:
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    def _score_teacher(self, input_ids: torch.Tensor, response_mask: torch.Tensor):
+        """TGSA: score student action tokens with the teacher sglang server.
+
+        Runs on the driver process (HTTP I/O). Returns
+        ``(teacher_log_prob, teacher_top2_or_None)`` where teacher_log_prob is
+        (bs, response_length). The optional margin runner-up (teacher_top2) is
+        computed only when the margin variant is enabled.
+        """
+        need_top2 = False
+        if self.tgsa_config is not None:
+            margin_cfg = self.tgsa_config.get("margin", {}) or {}
+            need_top2 = bool(margin_cfg.get("enabled", False))
+        return self.teacher_client.compute_teacher_signals(
+            input_ids, response_mask, need_top2=need_top2)
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
@@ -1043,6 +1104,37 @@ class RayPPOTrainer:
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
+
+        # TGSA: build the driver-side teacher HTTP client (sglang server) and a
+        # single-worker thread pool so teacher scoring overlaps with the Ray
+        # reward/old_log_prob/ref calls inside the loop.
+        if self.tgsa_enabled:
+            from concurrent.futures import ThreadPoolExecutor
+            from gigpo.teacher_client import SGLangTeacherClient
+            tcfg = self.tgsa_config
+            teacher_cfg = tcfg.get("teacher", {}) or {}
+            margin_cfg = tcfg.get("margin", {}) or {}
+            top_lp = int(margin_cfg.get("topk", 2)) if margin_cfg.get("enabled", False) else 0
+            self.teacher_client = SGLangTeacherClient(
+                base_url=teacher_cfg.get("base_url", "http://localhost:30000"),
+                max_concurrency=int(teacher_cfg.get("max_concurrency", 8)),
+                timeout=float(teacher_cfg.get("timeout", 60.0)),
+                max_retries=int(teacher_cfg.get("max_retries", 3)),
+                top_logprobs_num=top_lp,
+            )
+            self._tgsa_executor = ThreadPoolExecutor(max_workers=1)
+            if not self.teacher_client.health_check():
+                print(f"[TGSA] WARNING: teacher server at {teacher_cfg.get('base_url')} did not "
+                      f"respond to /health; the first teacher call will fail.")
+
+        # Side-channel tensorboard logger: writes tgsa_* / gigpo_group_* curves
+        # to the SAME $TENSORBOARD_DIR verl uses, so they merge into one view.
+        # Enabled once here when EITHER TGSA OR plain-GiGPO group stats are on.
+        # Disabled by default; teacher_client / core_gigpo / tgsa buffer stats,
+        # flushed once per step below. Degrades gracefully if tensorboard absent.
+        if self.tgsa_enabled or self._gigpo_log_groups:
+            from gigpo.tgsa_stats import TGSAStatsLogger
+            TGSAStatsLogger.get().enable()
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1118,11 +1210,34 @@ class RayPPOTrainer:
                     batch = adjust_batch(self.config, batch)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
+                    # TGSA: for multi-turn, unify response_mask with the actor's
+                    # loss_mask so the advantage/teacher mask selects the SAME
+                    # tokens as the policy loss. (The attention-derived mask would
+                    # otherwise select a different token set than loss_mask; this
+                    # inherited mismatch becomes load-bearing once TGSA uses the
+                    # mask for teacher preference / sigma^R_group stats.)
+                    if self.tgsa_enabled and self.config.actor_rollout_ref.rollout.multi_turn.enable:
+                        _resp_len = batch.batch["responses"].size(1)
+                        batch.batch["response_mask"] = batch.batch["loss_mask"][:, -_resp_len:]
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
+
+                    # TGSA: kick off teacher scoring NOW (after balance_batch, so
+                    # row order matches what compute_advantage will see). The HTTP
+                    # I/O overlaps with the reward / old_log_prob / ref Ray calls
+                    # below; the future is joined right before compute_advantage.
+                    # TGSA only modulates the GiGPO advantage, so skip for other
+                    # estimators (avoids wasted teacher HTTP when mis-configured).
+                    _teacher_future = None
+                    if self.tgsa_enabled and self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
+                        _teacher_future = self._tgsa_executor.submit(
+                            self._score_teacher,
+                            batch.batch["input_ids"],
+                            batch.batch["response_mask"],
+                        )
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1218,6 +1333,16 @@ class RayPPOTrainer:
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
+                        # TGSA: join the teacher scoring future (started after
+                        # balance_batch) and attach teacher log-probs to the batch
+                        # so compute_advantage can hand them to compute_tgsa_advantage.
+                        if _teacher_future is not None:
+                            _t_lp, _t_top2 = _teacher_future.result()
+                            _dev = batch.batch["old_log_probs"].device
+                            batch.batch["teacher_log_prob"] = _t_lp.to(_dev)
+                            if _t_top2 is not None:
+                                batch.batch["teacher_top2_logprob"] = _t_top2.to(_dev)
+
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1233,7 +1358,21 @@ class RayPPOTrainer:
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                            tgsa_config=self.tgsa_config,
+                            gigpo_config=dict(self.config.algorithm.gigpo),
                         )
+
+                        # Flush the side-channel stats buffered during teacher
+                        # scoring + compute_advantage to tensorboard, on the true
+                        # global-step axis. Runs for TGSA OR plain-GiGPO group
+                        # stats; no-op otherwise (logger stays disabled). Lands
+                        # before the critic/actor updates of this step.
+                        if self.tgsa_enabled or self._gigpo_log_groups:
+                            try:
+                                from gigpo.tgsa_stats import TGSAStatsLogger
+                                TGSAStatsLogger.get().flush(int(self.global_steps))
+                            except Exception:  # noqa: BLE001 - never let logging crash a step
+                                pass
 
                     # update critic
                     if self.use_critic:
@@ -1247,6 +1386,18 @@ class RayPPOTrainer:
                         # update actor
                         with _timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            # TGSA: pass the env-gated teacher-KL regularizer
+                            # params to the actor. coef>0 implies tgsa enabled
+                            # + GiGPO, which guarantees teacher_log_prob is in
+                            # the batch (set in the adv block above).
+                            if self.tgsa_enabled and self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
+                                _kl_cfg = self.tgsa_config.get("kl", {}) or {}
+                                batch.meta_info["tgsa_kl_teacher_coef"] = float(_kl_cfg.get("kl_teacher_coef", 0.0))
+                                batch.meta_info["tgsa_kl_penalty"] = str(_kl_cfg.get("kl_penalty", "k3"))
+                                batch.meta_info["tgsa_kl_gate_eta"] = float(_kl_cfg.get("kl_gate_eta", 1.0))
+                                batch.meta_info["tgsa_kl_gate_mode"] = str(_kl_cfg.get("kl_gate_mode", "hard"))
+                            else:
+                                batch.meta_info["tgsa_kl_teacher_coef"] = 0.0
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

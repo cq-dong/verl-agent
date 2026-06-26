@@ -40,7 +40,10 @@ if __name__ == '__main__':
     See details: https://github.com/langfengQ/verl-agent?tab=readme-ov-file#2-data-preparation
     """
 
-    dataset = datasets.load_dataset(data_source)
+    if args.data_path:
+        dataset = datasets.load_from_disk(args.data_path)
+    else:
+        dataset = datasets.load_dataset(data_source)
 
     train_dataset = dataset['train'].select(range(args.train_data_size))
     test_dataset = dataset['test'].select(range(args.val_data_size))

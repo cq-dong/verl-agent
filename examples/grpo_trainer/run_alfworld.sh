@@ -1,23 +1,75 @@
 set -x
 ENGINE=${1:-vllm}
-export VLLM_ATTENTION_BACKEND=XFORMERS
+# export VLLM_ATTENTION_BACKEND=XFORMERS
 
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
 train_data_size=16
-val_data_size=128
+val_data_size=16
 group_size=8
 
-# We only use data preparation to indicate the modality and the data size.
-python3 -m examples.data_preprocess.prepare \
-    --mode 'text' \
-    --train_data_size $train_data_size \
-    --val_data_size $val_data_size
 
-python3 -m verl.trainer.main_ppo \
+project_name='verl_agent_alfworld'
+experiment_name='grpo_qwen2.5_1.5bdebug'
+mkdir -p ./logs/${project_name}/${experiment_name}
+mkdir -p ./modelsave/${project_name}/${experiment_name}
+
+model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-xt-ai-search/ai-search/dongchengqi/huggingface.co/Qwen/Qwen2.5-1.5B-Instruct
+export ALFWORLD_DATA="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-xt-ai-search/ai-search/dongchengqi/huggingface.co/alfworld"
+export TENSORBOARD_DIR="./logs/${project_name}/${experiment_name}"
+
+# Raise the per-user thread/process limit (RLIMIT_NPROC). With 8 GPUs verl
+# spawns 8 colocated GPU worker processes (1 per GPU, each holding
+# actor+rollout+ref+critic), and vLLM rollout processes are thread-heavy
+# (hundreds of threads each). Combined with ~144 AlfWorld env worker processes,
+# the default `ulimit -u` (often 4096–65535 in containers) gets exhausted and
+# you get: "pthread_create failed: Resource temporarily unavailable" /
+# "thread: Resource temporarily unavailable [system:11]" -> SIGABRT, which is
+# why 4 GPUs run fine but 8 GPUs crash during init_workers()/ref policy init.
+# This is EAGAIN on thread creation, NOT a GPU-memory OOM.
+# `ulimit -u unlimited` may fail if the hard limit is capped; fall back to a
+# large number. Requires the host/kernel limits (kernel.threads-max,
+# vm.max_map_count) to be high enough — set those via sysctl as root if needed.
+ulimit -u unlimited 2>/dev/null || ulimit -u 262144 2>/dev/null || true
+echo "[DEBUG] ulimit -u (max user processes/threads): $(ulimit -u)"
+echo "[DEBUG] ulimit -n (open files): $(ulimit -n)"
+
+# Extend Ray worker registration timeout to handle slow AlfWorld env startup.
+# Each AlfworldWorker process imports torch/torchvision/alfworld and loads
+# TextWorld game files; on 8 GPUs the concurrent heavy-import process count
+# doubles vs 4 GPUs (actor/rollout/ref/critic are colocated, 1 process per GPU
+# per main_ppo.py resource_pool_spec), which can exceed Ray's default 60s
+# registration timeout. The raylet then logs:
+#   "Some workers of the worker process have not registered within the timeout.
+#    The process is still alive, probably it's hanging during start."
+# NOTE: the env var is in SECONDS (not milliseconds — the _milliseconds variant
+# is a no-op). This is why 4 GPUs run fine but 8 GPUs hang at startup.
+export RAY_worker_register_timeout_seconds=600
+
+# Set Ray num_cpus explicitly. The default (`null` = use all CPUs) can cause
+# workers to hang in resource-limited/cgrouped environments (verl's own
+# ppo_trainer.yaml warns about this). Env workers demand
+# (train_batch_size*group_n + val_batch_size) * 0.1 CPU-units; an explicit
+# num_cpus keeps Ray's scheduling honest. Override by exporting RAY_NUM_CPUS.
+if [ -z "${RAY_NUM_CPUS:-}" ]; then
+    if command -v nproc >/dev/null 2>&1; then
+        RAY_NUM_CPUS=$(nproc)
+    else
+        RAY_NUM_CPUS=$(sysctl -n hw.ncpu)   # macOS fallback
+    fi
+fi
+echo "[DEBUG] RAY_NUM_CPUS set to: $RAY_NUM_CPUS"
+
+# We only use data preparation to indicate the modality and the data size.
+# python3 -m examples.data_preprocess.prepare \
+#     --mode 'text' \
+#     --train_data_size $train_data_size \
+#     --val_data_size $val_data_size
+
+python3  -X faulthandler -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=$HOME/data/verl-agent/text/train.parquet \
-    data.val_files=$HOME/data/verl-agent/text/test.parquet \
+    data.train_files=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-xt-ai-search/ai-search/dongchengqi/verl-agent/data/verl-agent/text/train.parquet \
+    data.val_files=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-xt-ai-search/ai-search/dongchengqi/verl-agent/data/verl-agent/text/test.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
     data.max_prompt_length=2048 \
@@ -25,11 +77,11 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-1.5B-Instruct \
+    actor_rollout_ref.model.path=$model_path \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -56,12 +108,14 @@ python3 -m verl.trainer.main_ppo \
     env.rollout.n=$group_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','wandb'] \
-    trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='grpo_qwen2.5_1.5b' \
-    trainer.n_gpus_per_node=2 \
+    trainer.logger=['console','tensorboard'] \
+    trainer.project_name=$project_name \
+    trainer.experiment_name=$experiment_name \
+    trainer.default_local_dir=./modelsave/${project_name}/${experiment_name} \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=50 \
     trainer.test_freq=5 \
     trainer.total_epochs=150 \
-    trainer.val_before_train=True $@
+    trainer.val_before_train=True \
+    ray_init.num_cpus=$RAY_NUM_CPUS $@

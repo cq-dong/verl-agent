@@ -1,12 +1,47 @@
 set -x
 ENGINE=${1:-vllm}
 ulimit -u 65536
-export VLLM_ATTENTION_BACKEND=XFORMERS
+# export VLLM_ATTENTION_BACKEND=XFORMERS  # disabled: xformers not built with CUDA support
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+# ---- pick a Java >= 8 (pyserini 0.17 bundles Lucene 8 = Java 8 bytecode) ----
+# On this box `/usr/local/java` symlinks to jdk1.7.0_76 (Java 7) and breaks
+# pyserini with `UnsupportedClassVersionError: ... version 52.0`. Scan known JDK
+# dirs and pick the first whose `java -version` is >= 8. Order: inherited
+# JAVA_HOME/JDK_HOME first, then system openjdk 11, /workdir JDK 11, JDK 8.
+JAVA_HOME_FOUND=""
+for d in "${JAVA_HOME:-}" "${JDK_HOME:-}" \
+         /usr/lib/jvm/java-11-openjdk-11.0.22.0.7-1.el7_9.x86_64 \
+         /workdir/mjdk-11.0.16 \
+         /usr/local/jdk1.8.0_45; do
+  [ -n "$d" ] && [ -x "$d/bin/java" ] || continue
+  v=$("$d/bin/java" -version 2>&1 | awk -F\" '/version "/ {print $2; exit}')
+  major=$(printf '%s' "$v" | awk -F. '{ if ($1==1) print $2; else print $1 }')
+  if [ -n "$major" ] && [ "$major" -ge 8 ] 2>/dev/null; then
+    JAVA_HOME_FOUND="$d"; break
+  fi
+done
+export JAVA_HOME="${JAVA_HOME_FOUND:-/usr/local/java}"
+export JDK_HOME="$JAVA_HOME"          # pyjnius checks JDK_HOME before JAVA_HOME
+export PATH="$JAVA_HOME/bin:$PATH"
+# pyjnius dlopens libjvm.so to start the JVM. Prepend the chosen JDK's libjvm
+# dir (JDK11+: lib/server; JDK8: jre/lib/*/server) so dlopen doesn't fall back
+# to the box's Java 7 libjvm. Propagated to workers via runtime_env.env_vars.
+JVM_SERVER_DIR=$(ls -d "$JAVA_HOME"/lib/server "$JAVA_HOME"/jre/lib/*/server 2>/dev/null | head -1)
+[ -n "$JVM_SERVER_DIR" ] && export LD_LIBRARY_PATH="$JVM_SERVER_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+echo "[INFO] JAVA_HOME=$JAVA_HOME, java: $($JAVA_HOME/bin/java -version 2>&1 | head -1)"
+
+# Limit per-worker JVM heap/threads so many concurrent WebshopWorker JVMs don't
+# exhaust the system thread limit (EAGAIN). pyjnius starts the JVM via
+# JNI_CreateJavaVM, which ignores `_JAVA_OPTIONS` (launcher-only) but DOES read
+# `JAVA_TOOL_OPTIONS` (honoured by the embedded JVM). Propagated to workers via
+# runtime_env.env_vars below.
+export JAVA_TOOL_OPTIONS="-Xss256k -XX:+UseSerialGC -Xmx256m -XX:-UsePerfData"
 
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
 train_data_size=16
-val_data_size=128
+val_data_size=16   # reduced from 128: 128×8=1024 workers exhausts system thread limit
 group_size=8
 mode="mean_norm" # "mean_norm" or "mean_std_norm"
 
@@ -18,6 +53,11 @@ python3 -m examples.data_preprocess.prepare \
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gigpo \
+    +ray_init.runtime_env.env_vars.JAVA_HOME=$JAVA_HOME \
+    +ray_init.runtime_env.env_vars.JDK_HOME=$JDK_HOME \
+    +ray_init.runtime_env.env_vars.PATH=$PATH \
+    +ray_init.runtime_env.env_vars.LD_LIBRARY_PATH=$LD_LIBRARY_PATH \
+    +ray_init.runtime_env.env_vars.JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS" \
     data.train_files=$HOME/data/verl-agent/text/train.parquet \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$train_data_size \
