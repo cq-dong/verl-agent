@@ -265,6 +265,9 @@ def compute_teacher_preference_signal(
     delta_norm_clip: float = 0.0,
     out_stats: Optional[dict] = None,
     out_hists: Optional[dict] = None,
+    # PowerOPD additions:
+    use_poweropd: bool = False,
+    power_alpha: float = 5.0,
 ) -> torch.Tensor:
     """Compute the unified teacher preference signal L_T_tilde in [-1, 1].
 
@@ -301,6 +304,10 @@ def compute_teacher_preference_signal(
             spread out, the signal is compressed. If >0, clamp delta_norm to
             [-delta_norm_clip, +delta_norm_clip] BEFORE tanh, bounding the
             amplification. 0.0 = off (pure z-score). Recommended ~3.0.
+        use_poweropd: Enable PowerOPD bounded power rewards (arXiv:2606.17199).
+            When True, replaces unbounded log-ratio with bounded π_T^α - π_θ^α.
+        power_alpha: Power coefficient for PowerOPD (default 5.0). Larger values
+            emphasize high-probability tokens more (filtering low-prob noise).
 
     Returns:
         L_T_tilde: (bs,) in [-1, 1]. >0 teacher relatively approves, <0 disapproves.
@@ -314,15 +321,26 @@ def compute_teacher_preference_signal(
     gsize = group_size_per_row.to(device=device, dtype=torch.long)
     is_group = (gsize >= 2)   # (bs,) bool, Case 1 mask
 
+    # Import PowerOPD functions if needed
+    if use_poweropd:
+        from gigpo.poweropd import compute_power_diff, compute_power_margin
+
     # ---- Case 1: group-internal ranking over TEACHER log-prob ----
     ranking_value = teacher_lp
     if use_margin:
         assert teacher_top2_logprob is not None, \
             "use_margin=True requires teacher_top2_logprob (teacher runner-up log-prob)."
-        # m_t = log pi_T(a_t) - max_{a'!=a_t} log pi_T(a'); length-normalized a_t,
-        # runner-up is a per-step scalar (caller-chosen aggregation, e.g. last token).
         runner = teacher_top2_logprob.to(device=device, dtype=teacher_lp.dtype)
-        ranking_value = teacher_lp - runner
+        if use_poweropd:
+            # PowerOPD margin: π_T^α - π_runnerup^α (bounded ∈ [-1, 1])
+            ranking_value = compute_power_margin(
+                teacher_lp, runner, alpha=power_alpha
+            )
+        else:
+            # Original log-margin (unbounded)
+            # m_t = log pi_T(a_t) - max_{a'!=a_t} log pi_T(a'); length-normalized a_t,
+            # runner-up is a per-step scalar (caller-chosen aggregation, e.g. last token).
+            ranking_value = teacher_lp - runner
 
     if normalization_mode == "rank":
         # Rank-based normalization: immune to outliers and near-zero spread.
@@ -342,43 +360,73 @@ def compute_teacher_preference_signal(
             raise ValueError(f"Unknown normalization_mode: {normalization_mode}")
 
     # ---- Case 2: singleton, teacher-student difference ----
-    # Raw delta is E_{a~pi_theta}[log pi_T - log pi_theta] = -D_KL(pi_theta||pi_T) <= 0,
-    # so delta is systematically negative (Jensen's inequality).  Applying tanh directly
-    # would produce a signal that is almost always negative, breaking four-quadrant
-    # semantics for singleton rows.
-    #
-    # Fix: batch-level z-score normalisation of delta OVER SINGLETON ROWS ONLY before
-    # tanh compression.  After normalisation, ~50% of singleton rows have delta > mu_delta
-    # (positive) and ~50% below (negative), restoring the correct signal polarity.
-    # The normalised signal still means "teacher prefers this action MORE than average
-    # for this batch" (positive) / "LESS than average" (negative), which is semantically
-    # consistent with the group-ranking Case-1 signal.
-    #
-    # Reference: idea.md §"两类教师信号的分布校准".
-    delta = teacher_lp - student_lp              # (bs,) >0 teacher prefers more (raw)
-
-    # compute mean/std over singleton rows only
     singleton_mask = ~is_group                   # (bs,) bool
-    mu_delta = delta.new_zeros(())
-    std_delta = delta.new_ones(())   # sentinel; unused when there are no singletons
-    if singleton_mask.any():
-        singleton_deltas = delta[singleton_mask]
-        mu_delta = singleton_deltas.mean()
-        std_delta = singleton_deltas.std(unbiased=False).clamp(min=eps)
-        delta_norm = (delta - mu_delta) / (std_delta + eps)
+
+    if use_poweropd:
+        # PowerOPD Case 2: bounded power difference, no tanh needed
+        # Δ^α = π_T^α - π_θ^α, naturally ∈ [-1, 1]
+        delta_power = compute_power_diff(
+            teacher_lp, student_lp,
+            alpha=power_alpha,
+            length_normalize=False,  # already length-normalized above
+        )  # (bs,), ∈ [-1, 1] naturally
+
+        # Normalize over singleton rows only (same logic as z-score for consistency)
+        mu_delta = delta_power.new_zeros(())
+        std_delta = delta_power.new_ones(())
+        if singleton_mask.any():
+            singleton_deltas = delta_power[singleton_mask]
+            mu_delta = singleton_deltas.mean()
+            std_delta = singleton_deltas.std(unbiased=False).clamp(min=eps)
+            delta_norm = (delta_power - mu_delta) / (std_delta + eps)
+        else:
+            delta_norm = delta_power  # unused
+
+        # Scale by gamma (no tanh since already bounded)
+        delta_norm_pre = delta_norm
+        if delta_norm_clip and delta_norm_clip > 0.0:
+            delta_norm = delta_norm.clamp(min=-delta_norm_clip, max=delta_norm_clip)
+
+        case2 = gamma * delta_norm  # ∈ [-gamma, gamma]
+
+        # Use delta_power for stats (actual bounded power difference)
+        delta = delta_power
+
     else:
-        # all rows belong to valid groups; Case-2 path will not be used
-        delta_norm = delta  # unused; torch.where mask will select case1 for all rows
+        # Original log-ratio + tanh path
+        # Raw delta is E_{a~pi_theta}[log pi_T - log pi_theta] = -D_KL(pi_theta||pi_T) <= 0,
+        # so delta is systematically negative (Jensen's inequality).  Applying tanh directly
+        # would produce a signal that is almost always negative, breaking four-quadrant
+        # semantics for singleton rows.
+        #
+        # Fix: batch-level z-score normalisation of delta OVER SINGLETON ROWS ONLY before
+        # tanh compression.  After normalisation, ~50% of singleton rows have delta > mu_delta
+        # (positive) and ~50% below (negative), restoring the correct signal polarity.
+        #
+        # Reference: idea.md §"两类教师信号的分布校准".
+        delta = teacher_lp - student_lp              # (bs,) >0 teacher prefers more (raw)
 
-    # Stability guard (idea optional): batch z-score makes the singleton signal
-    # depend on batch composition -- a tightly-clustered batch yields tiny
-    # sigma_Delta and a blown-up delta_norm (tanh saturates, resolution lost).
-    # Clamp before tanh to bound the amplification. Off when delta_norm_clip<=0.
-    delta_norm_pre = delta_norm  # pre-clip form, kept for stats/logging
-    if delta_norm_clip and delta_norm_clip > 0.0:
-        delta_norm = delta_norm.clamp(min=-delta_norm_clip, max=delta_norm_clip)
+        # compute mean/std over singleton rows only
+        mu_delta = delta.new_zeros(())
+        std_delta = delta.new_ones(())   # sentinel; unused when there are no singletons
+        if singleton_mask.any():
+            singleton_deltas = delta[singleton_mask]
+            mu_delta = singleton_deltas.mean()
+            std_delta = singleton_deltas.std(unbiased=False).clamp(min=eps)
+            delta_norm = (delta - mu_delta) / (std_delta + eps)
+        else:
+            # all rows belong to valid groups; Case-2 path will not be used
+            delta_norm = delta  # unused; torch.where mask will select case1 for all rows
 
-    case2 = torch.tanh(gamma * delta_norm)
+        # Stability guard (idea optional): batch z-score makes the singleton signal
+        # depend on batch composition -- a tightly-clustered batch yields tiny
+        # sigma_Delta and a blown-up delta_norm (tanh saturates, resolution lost).
+        # Clamp before tanh to bound the amplification. Off when delta_norm_clip<=0.
+        delta_norm_pre = delta_norm  # pre-clip form, kept for stats/logging
+        if delta_norm_clip and delta_norm_clip > 0.0:
+            delta_norm = delta_norm.clamp(min=-delta_norm_clip, max=delta_norm_clip)
+
+        case2 = torch.tanh(gamma * delta_norm)
 
     # ---- unify ----
     l_tilde = torch.where(is_group, case1, case2)
@@ -387,6 +435,10 @@ def compute_teacher_preference_signal(
 
     # ---- stats (side-channel; no-op effect on the returned tensor) ----
     if out_stats is not None:
+        # Record PowerOPD usage
+        out_stats["tgsa_signal/poweropd_enabled"] = 1.0 if use_poweropd else 0.0
+        if use_poweropd:
+            out_stats["tgsa_signal/power_alpha"] = float(power_alpha)
         _fill_signal_stats(
             out_stats, out_hists,
             l_tilde=l_tilde, delta=delta, mu_delta=mu_delta, std_delta=std_delta,
@@ -424,6 +476,9 @@ def compute_tgsa_advantage(
     delta_norm_clip: float = 0.0,
     out_stats: Optional[dict] = None,
     out_hists: Optional[dict] = None,
+    # PowerOPD additions:
+    use_poweropd: bool = False,
+    power_alpha: float = 5.0,
 ):
     """Compose the TGSA total advantage tensor (bs, response_length).
 
@@ -449,6 +504,8 @@ def compute_tgsa_advantage(
         delta_norm_clip: Case-2 stability guard (see compute_teacher_preference_signal).
             Clamp delta_norm to [-c, c] before tanh to bound batch-composition
             amplification. 0.0 = off. Recommended ~3.0.
+        use_poweropd: Enable PowerOPD bounded power rewards.
+        power_alpha: Power coefficient for PowerOPD (default 5.0).
 
     Returns:
         A_total: (bs, response_length), same shape/contract as GiGPO ``scores``.
@@ -469,6 +526,9 @@ def compute_tgsa_advantage(
         delta_norm_clip=delta_norm_clip,
         out_stats=out_stats,
         out_hists=out_hists,
+        # PowerOPD:
+        use_poweropd=use_poweropd,
+        power_alpha=power_alpha,
     )                                                                     # (bs,) in [-1,1]
 
     # degeneration indicator: 1_deg = 1[sigma^R_group <= eps_deg].
