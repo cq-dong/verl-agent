@@ -178,3 +178,51 @@ class TestComputePowerOPDAdvantage:
         adv2, _ = compute_power_opd_advantage(log_T, log_S, mask, kl_coef=2.0)
 
         assert torch.allclose(adv2, 2.0 * adv1, atol=1e-6)
+
+
+class TestOPDWithPowerOPD:
+    """Test pure OPD with PowerOPD mode"""
+
+    def test_opd_poweropd_vs_vanilla(self):
+        """OPD PowerOPD should produce bounded advantages"""
+        from gigpo.opd import compute_opd_advantage
+
+        bs, seq_len = 4, 10
+        log_T = torch.randn(bs, seq_len) * 0.5 - 1.0
+        log_S = torch.randn(bs, seq_len) * 0.5 - 2.0
+        mask = torch.ones(bs, seq_len)
+
+        # PowerOPD mode
+        adv_power, _ = compute_opd_advantage(
+            log_S, log_T, mask, seq_len,
+            use_poweropd=True, power_alpha=5.0
+        )
+
+        # Vanilla mode
+        adv_vanilla, _ = compute_opd_advantage(
+            log_S, log_T, mask, seq_len,
+            use_poweropd=False, kl_penalty="k3"
+        )
+
+        # Both should be properly masked
+        assert (adv_power[mask == 0] == 0).all()
+        assert (adv_vanilla[mask == 0] == 0).all()
+
+    def test_opd_poweropd_stats(self):
+        """PowerOPD OPD should log correct stats"""
+        from gigpo.opd import compute_opd_advantage
+
+        bs, seq_len = 4, 10
+        log_T = torch.randn(bs, seq_len) * 0.5 - 1.0
+        log_S = torch.randn(bs, seq_len) * 0.5 - 2.0
+        mask = torch.ones(bs, seq_len)
+        out_stats = {}
+
+        compute_opd_advantage(
+            log_S, log_T, mask, seq_len,
+            use_poweropd=True, power_alpha=5.0,
+            out_stats=out_stats
+        )
+
+        assert out_stats["opd/poweropd_enabled"] == 1.0
+        assert out_stats["opd/power_alpha"] == 5.0
