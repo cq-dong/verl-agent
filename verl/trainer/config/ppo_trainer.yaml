@@ -252,6 +252,40 @@ algorithm:
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
+    log_group_stats: True # 是否将分组结构统计写入 TensorBoard 的 gigpo_group/ 面板（包括组数、组大小分布、单成员/多成员比例、退化率、全成功/全失败比例）。与 TGSA 无关，纯 GiGPO 也可用。
+    eps_deg: 0.01 # 退化组判定阈值：episode 组的回报标准差 σ^R_group ≤ 此值时视为退化（建议 ~0.01）
+    success_thresh: 0.0 # 区分退化组为"全成功"或"全失败"的回报均值阈值：> thresh 为全成功，≤ thresh 为全失败。0/1 奖励时用 0.0。
+  opd: # 纯 OPD 消融基线（ROLL 标准）：advantage = -coef·KL(pi_theta||pi_T)，无环境奖励/门控/critic。algorithm.adv_estimator=opd 时生效。教师复用 algorithm.tgsa.teacher config（与 TGSA 共用同一教师服务，便于公平对比）。
+    kl_coef: 1.0 # KL 蒸馏系数（对应 ROLL opd_kl_coef，默认 1.0）
+    kl_penalty: "k3" # KL 估计形式，与 ROLL 一致；可选 "kl"(k1)/"abs"/"mse"
+  tgsa: # TGSA-GRPO：在 GiGPO 基础上引入教师模型的步级优势调制
+    enabled: False # 总开关。False 时教师服务器永远不被调用，走原始 GiGPO 逻辑
+    # 优势公式：A_total = A^E + lambda*L_T*|A^E| + mu*1_deg*L_T
+    lambda: 0.3 # 正常多成员组的教师调制强度（建议范围 0.2~0.5）
+    mu: 0.1 # 退化组（全成功/全失败）时的纯教师信号强度（建议 ~0.1）
+    gamma: 1.0 # Case-2（singleton 行）中 tanh 的缩放因子：tanh(gamma * delta_norm)
+    eps_deg: 0.01 # 退化检测阈值：σ^R_group ≤ 此值时触发 mu 项（建议 ~0.01）
+    success_thresh: 0.0 # 退化组内区分全成功/全失败的回报阈值，用于 mu+/mu- 统计。0/1 奖励时用 0.0。
+    normalization_mode: "minmax" # Case-1 组内教师 log-prob 的归一化方式："minmax"（默认）| "zscore" | "rank"（对极端 log-prob 最鲁棒）
+    replace_step_advantage: True # True：丢弃 GiGPO 的 A^S 步级优势，完全用 A_total 替换；False：在 A_total 基础上加回 step_advantage_w*A^S（消融实验用）
+    bounded_env_scaling: "none" # lambda 项中对 |A^E| 的缩放方式："none"（原始）| "tanh"（软截断）| "clip"（硬截断到1）
+    delta_norm_clip: 0.0 # Case-2 稳定性保护：在 tanh 前将 singleton 的 batch-zscore 截断到 [-c, c]。0=关闭，建议设 ~3.0 防止 tanh 全饱和
+    # 教师模型 = 外部 sglang HTTP 服务（非 verl Ray worker），与学生共享 tokenizer，直接接收 input_ids
+    teacher:
+      base_url: "http://localhost:30000" # sglang 教师服务器地址
+      max_concurrency: 8 # 并发 HTTP 打分请求数（每行一个请求）
+      timeout: 60.0 # 单次请求超时时间（秒）
+      max_retries: 3 # 请求失败后的最大重试次数
+    # 可选：环境门控的逆向 KL 蒸馏正则项，默认关闭
+    kl:
+      kl_teacher_coef: 0.0 # KL 正则系数 β。0.0=关闭；>0 时在 actor loss 中加入 β * gate * D_KL(π_θ||π_T)
+      kl_penalty: "k3" # 单 token 反向 KL 的估计方式："kl"（k1 无偏高方差）| "k3"（低方差，默认）| "mse" | "abs"
+      kl_gate_eta: 1.0 # soft gate 的 sigmoid 缩放系数，仅在 kl_gate_mode="soft" 时生效
+      kl_gate_mode: "hard" # KL 门控方式："hard"=只对 A^E>0 的成功行施加 KL；"soft"=sigmoid(eta*A^E) 软门控
+    # 可选：margin 变体，将 Case-1 的排名值升级为教师确信度差值，默认关闭
+    margin:
+      enabled: False # True：Case-1 排名值改为 teacher_lp - runner-up（需要 sglang 返回 top-k log-prob）
+      topk: 2 # sglang 返回的 top-k 数量，用于获取 runner-up log-prob（margin.enabled=True 时生效）
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10

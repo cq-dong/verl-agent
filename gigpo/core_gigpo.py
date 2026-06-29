@@ -135,6 +135,149 @@ def compute_step_discounted_returns(batch: DataProto, gamma: float):
 # ---------------- Core Functions of GiGPO ----------------- #
 # ---------------------------------------------------------- #
 
+def _step_group_size_per_row(step_group_uids: np.array) -> torch.Tensor:
+    """|G_t| per row: the anchor-state (step) group size each row belongs to.
+
+    Derived inline from ``step_group_uids`` (the UUID array produced by
+    ``build_step_group``) so no upstream signature has to change. Singletons
+    (unique uid) get size 1.
+
+    Returns:
+        (bs,) int64 tensor of group sizes.
+    """
+    uids = np.asarray(step_group_uids, dtype=object)
+    uniq, counts = np.unique(uids, return_counts=True)
+    uid2count = {u: int(c) for u, c in zip(uniq, counts)}
+    gsize = np.array([uid2count[u] for u in uids], dtype=np.int64)
+    return torch.tensor(gsize, dtype=torch.long)
+
+
+def _episode_group_return_std(token_level_rewards: torch.Tensor,
+                              index: np.array,
+                              traj_index: np.array,
+                              epsilon: float = 1e-6) -> torch.Tensor:
+    """sigma^R_group per row: std of trajectory-level total returns within each
+    episode (prompt) group. Used by TGSA's degeneration indicator 1_deg.
+
+    Rationale (idea.md L86-110): 1_deg must fire exactly when the environment
+    signal collapses for a row, i.e. when A^E ~ 0. A^E is normalized within the
+    EPISODE group, so the degeneration std is taken over the episode group's
+    trajectory returns (NOT the step group). When all trajectories in a prompt
+    group share the same return, sigma^R_group ~ 0 -> 1_deg = 1 and the mu
+    fallback activates; otherwise the lambda modulation term carries the signal.
+
+    A row's value is shared by all rows of the same episode group. Singleton
+    episode groups (one trajectory) get std=1.0 (sentinel -> 1_deg False),
+    mirroring ``episode_norm_reward``'s convention.
+
+    Args:
+        token_level_rewards: (bs, response_length).
+        index: (bs,) episode-group uid per row.
+        traj_index: (bs,) trajectory uid per row.
+        epsilon: unused (kept for API symmetry).
+
+    Returns:
+        (bs,) float32 sigma^R_group per row.
+    """
+    device = token_level_rewards.device
+    row_returns = token_level_rewards.sum(dim=-1).detach().cpu().numpy()  # (bs,)
+    index = np.asarray(index)
+    traj_index = np.asarray(traj_index)
+
+    # per-trajectory total return = sum of its per-step token rewards
+    traj_return: dict = {}
+    traj_to_index: dict = {}
+    for i in range(len(traj_index)):
+        t = traj_index[i]
+        traj_return[t] = traj_return.get(t, 0.0) + float(row_returns[i])
+        traj_to_index[t] = index[i]
+
+    id2returns: dict = defaultdict(list)
+    for t, r in traj_return.items():
+        id2returns[traj_to_index[t]].append(r)
+
+    id2std: dict = {}
+    for idx, rets in id2returns.items():
+        if len(rets) <= 1:
+            id2std[idx] = 1.0  # singleton sentinel -> 1_deg False
+        else:
+            id2std[idx] = float(np.std(rets))  # population std
+
+    out = np.array([id2std[index[i]] for i in range(len(index))], dtype=np.float32)
+    return torch.tensor(out, device=device)
+
+
+def _tgsa_cfg_echo(tgsa_config: dict) -> dict:
+    """Numeric config values for the ``tgsa_cfg/`` tensorboard panel.
+
+    Lets runs be compared and confirms the values that actually loaded. String-
+    valued knobs (normalization_mode, bounded_env_scaling, kl_penalty,
+    kl_gate_mode) are NOT ``add_scalar``-safe (tensorboard raises on non-numeric)
+    and are delivered via the wandb config instead, so they are omitted here.
+    """
+    kl_cfg = tgsa_config.get("kl", {}) or {}
+    teacher_cfg = tgsa_config.get("teacher", {}) or {}
+    margin_cfg = tgsa_config.get("margin", {}) or {}
+    return {
+        "tgsa_cfg/lambda": float(tgsa_config.get("lambda", 0.3)),
+        "tgsa_cfg/mu": float(tgsa_config.get("mu", 0.1)),
+        "tgsa_cfg/gamma": float(tgsa_config.get("gamma", 1.0)),
+        "tgsa_cfg/eps_deg": float(tgsa_config.get("eps_deg", 0.01)),
+        "tgsa_cfg/delta_norm_clip": float(tgsa_config.get("delta_norm_clip", 0.0)),
+        "tgsa_cfg/kl_teacher_coef": float(kl_cfg.get("kl_teacher_coef", 0.0)),
+        "tgsa_cfg/teacher_max_concurrency": float(teacher_cfg.get("max_concurrency", 8)),
+        "tgsa_cfg/margin_enabled": 1.0 if margin_cfg.get("enabled", False) else 0.0,
+    }
+
+
+def _record_and_return(*, log_group_stats: bool, eps_deg: float, success_thresh: float,
+                       token_level_rewards, index, traj_index, step_group_uids,
+                       sigma_r, tgsa_config, out_stats, out_hists, advantage):
+    """Shared exit: optionally record per-group structure stats + (TGSA) teacher
+    signal/cfg-echo stats to the side-channel logger, then return (adv, adv).
+
+    Both the TGSA and the plain-GiGPO branches funnel through here so the
+    per-group structural stats (group counts, size distribution, degeneration
+    rate, all-success/all-fail split) are recorded ONCE, gated by
+    ``log_group_stats`` -- independent of whether TGSA is on. Teacher-signal
+    stats (delta/l_tilde/...) are only present in ``out_stats`` when TGSA filled
+    them; plain GiGPO passes ``out_stats=None``.
+
+    Never raises: stats collection is best-effort and must not crash a step.
+    """
+    if not log_group_stats and out_stats is None:
+        return advantage, advantage
+    try:
+        from gigpo.tgsa_stats import compute_group_stats, TGSAStatsLogger
+        all_scalars: dict = {}
+        all_hists: dict = {}
+        if log_group_stats:
+            g_scalars, g_hists = compute_group_stats(
+                token_level_rewards=token_level_rewards,
+                index=index,
+                traj_index=traj_index,
+                step_group_uids=step_group_uids,
+                eps_deg=eps_deg,
+                success_thresh=success_thresh,
+                sigma_r=sigma_r,
+            )
+            all_scalars.update(g_scalars)
+            all_hists.update(g_hists)
+        if out_stats is not None:
+            all_scalars.update(out_stats)
+            all_hists.update(out_hists or {})
+            if tgsa_config is not None:
+                # numeric TGSA config echo (teacher-signal panel context)
+                all_scalars.update(_tgsa_cfg_echo(tgsa_config))
+        if all_scalars or all_hists:
+            _logger = TGSAStatsLogger.get()
+            _logger.record_scalars(all_scalars)
+            _logger.record_histograms(all_hists)
+    except Exception:  # noqa: BLE001 - stats must never crash a training step
+        pass
+    return advantage, advantage
+
+
 def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    step_rewards: torch.Tensor,
                                    response_mask: torch.Tensor,
@@ -146,9 +289,29 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    mode: str = "mean_norm",
                                    enable_similarity: bool = False,
                                    similarity_thresh: float = 0.95,
+                                   # --- GiGPO group-structure stats (independent of TGSA) ---
+                                   log_group_stats: bool = False,
+                                   gigpo_eps_deg: float = 0.01,
+                                   gigpo_success_thresh: float = 0.0,
+                                   # --- TGSA (teacher-guided step-level advantage) ---
+                                   teacher_log_prob: torch.Tensor = None,
+                                   old_log_probs: torch.Tensor = None,
+                                   teacher_top2_logprob: torch.Tensor = None,
+                                   tgsa_config: dict = None,
                                    ):
     """
     Compute the advantages for GiGPO (https://arxiv.org/abs/2505.10978).
+
+    TGSA-GRPO extension (idea.md): when ``teacher_log_prob`` and a ``tgsa_config``
+    with ``enabled=True`` are supplied, the joint advantage (Eq. 8) is REPLACED
+    by the teacher-guided total advantage
+
+        A_total = A^E + lambda * L_T_tilde * |A^E| + mu * 1_deg * L_T_tilde
+
+    computed in ``gigpo.tgsa.compute_tgsa_advantage``. |G_t| and sigma^R_group
+    are derived inline here. When TGSA is off (defaults), the original GiGPO
+    combination ``scores = A^E + step_advantage_w * A^S`` is returned unchanged,
+    so all existing call sites are protected.
     """
     if mode == "mean_std_norm":
         remove_std = False
@@ -156,19 +319,97 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
         remove_std = True
     else:
         raise ValueError(f"Unknown mode: {mode}")
-    
+
     # Compute episode relative advantages (Eq. 3 in the paper).
     episode_advantages = episode_norm_reward(token_level_rewards, response_mask, index, traj_index, epsilon, remove_std)
-    
+
     # Anchor state grouping (Eq. 6 in the paper).
     step_group_uids = build_step_group(anchor_obs, index, enable_similarity, similarity_thresh)
 
     # Compute step relative advantages (Eq. 7 in the paper).
     step_advantages = step_norm_reward(step_rewards, response_mask, step_group_uids, epsilon, remove_std)
 
-    # Compute joint advantages (Eq. 8 in the paper).
+    # ---- TGSA path (opt-in; default None preserves original GiGPO behavior) ----
+    tgsa_enabled = (tgsa_config is not None) and bool(tgsa_config.get("enabled", False))
+    if tgsa_enabled:
+        if teacher_log_prob is None:
+            raise ValueError("tgsa_config.enabled=True requires teacher_log_prob (bs, response_length).")
+        if old_log_probs is None:
+            raise ValueError("tgsa_config.enabled=True requires old_log_probs (bs, response_length).")
+
+        from gigpo.tgsa import compute_tgsa_advantage
+
+        response_length = token_level_rewards.shape[-1]
+        mask_f = response_mask.float()
+        denom = mask_f.sum(-1).clamp(min=1.0)
+        # recover the per-row scalar A^E / A^S from the broadcast (bs, L) tensors
+        # (each is constant within the action-token span, zero outside)
+        ep_row = (episode_advantages * mask_f).sum(-1) / denom            # (bs,) A^E
+        step_row = (step_advantages * mask_f).sum(-1) / denom             # (bs,) A^S
+        # |G_t| and sigma^R_group, derived inline (no upstream signature change)
+        gsize = _step_group_size_per_row(step_group_uids).to(episode_advantages.device)
+        sigma_r = _episode_group_return_std(token_level_rewards, index, traj_index, epsilon).to(episode_advantages.device)
+
+        replace_step = bool(tgsa_config.get("replace_step_advantage", True))
+        eps_deg = float(tgsa_config.get("eps_deg", 0.01))
+        # side-channel stats buffer (filled by compute_tgsa_advantage for the
+        # signal/advantage quantities, and by us below for the group structure).
+        # The logger is disabled outside RayPPOTrainer.fit, so in unit tests and
+        # non-TGSA recipe paths these dicts are built but never written.
+        out_stats: dict = {}
+        out_hists: dict = {}
+        a_total = compute_tgsa_advantage(
+            episode_advantages_row=ep_row,
+            teacher_log_prob=teacher_log_prob,
+            old_log_probs=old_log_probs,
+            response_mask=response_mask,
+            step_group_uids=step_group_uids,
+            group_size_per_row=gsize,
+            episode_group_std=sigma_r,
+            response_length=response_length,
+            lambda_=float(tgsa_config.get("lambda", 0.3)),
+            mu=float(tgsa_config.get("mu", 0.1)),
+            gamma=float(tgsa_config.get("gamma", 1.0)),
+            eps_deg=eps_deg,
+            normalization_mode=str(tgsa_config.get("normalization_mode", "minmax")),
+            replace_step_advantage=replace_step,
+            step_advantages_row=(None if replace_step else step_row),
+            step_advantage_w=step_advantage_w,
+            bounded_env_scaling=str(tgsa_config.get("bounded_env_scaling", "none")),
+            teacher_top2_logprob=teacher_top2_logprob,
+            use_margin=bool(tgsa_config.get("use_margin", False)),
+            delta_norm_clip=float(tgsa_config.get("delta_norm_clip", 0.0)),
+            out_stats=out_stats,
+            out_hists=out_hists,
+        )
+
+        return _record_and_return(
+            log_group_stats=log_group_stats,
+            eps_deg=eps_deg,
+            success_thresh=float(tgsa_config.get("success_thresh", gigpo_success_thresh)),
+            token_level_rewards=token_level_rewards,
+            index=index, traj_index=traj_index,
+            step_group_uids=step_group_uids,
+            sigma_r=sigma_r,
+            tgsa_config=tgsa_config,
+            out_stats=out_stats, out_hists=out_hists,
+            advantage=a_total,
+        )
+
+    # ---- original GiGPO joint advantages (Eq. 8 in the paper) ----
     scores = episode_advantages + step_advantage_w * step_advantages
-    return scores, scores
+    return _record_and_return(
+        log_group_stats=log_group_stats,
+        eps_deg=gigpo_eps_deg,
+        success_thresh=gigpo_success_thresh,
+        token_level_rewards=token_level_rewards,
+        index=index, traj_index=traj_index,
+        step_group_uids=step_group_uids,
+        sigma_r=None,                # plain GiGPO: compute group std internally
+        tgsa_config=None,
+        out_stats=None, out_hists=None,
+        advantage=scores,
+    )
 
 
 def episode_norm_reward(token_level_rewards: torch.Tensor,

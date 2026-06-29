@@ -30,6 +30,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, compute_policy_loss_gspo, kl_penalty
+from gigpo.tgsa import compute_reverse_kl_token
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -321,11 +322,22 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
+        # TGSA: env-gated teacher-KL regularizer (idea.md L245-280). Opt-in via
+        # meta_info set by the trainer; coef<=0 (default) keeps behavior unchanged.
+        tgsa_kl_coef = float(data.meta_info.get("tgsa_kl_teacher_coef", 0.0))
+        tgsa_kl_penalty = str(data.meta_info.get("tgsa_kl_penalty", "k3"))
+        tgsa_kl_gate_eta = float(data.meta_info.get("tgsa_kl_gate_eta", 1.0))
+        tgsa_kl_gate_mode = str(data.meta_info.get("tgsa_kl_gate_mode", "hard"))
+        use_tgsa_kl = tgsa_kl_coef > 0
+
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if use_tgsa_kl:
+            # coef>0 implies the trainer attached teacher_log_prob to the batch
+            select_keys.append("teacher_log_prob")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -424,6 +436,31 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                    if use_tgsa_kl:
+                        # TGSA env-gated teacher-KL regularizer:
+                        #   beta_T * sigma(eta * A^E) * D_KL(pi_theta || pi_T)
+                        # D_KL is the single-token MC reverse-KL at the student-
+                        # sampled tokens, using the CURRENT policy log_prob (zero
+                        # extra forward -- teacher_log_prob was precomputed). The
+                        # gate activates only on success trajectories (A^E>0); the
+                        # hard gate uses sign(advantages), which is sign-exact for
+                        # A^E because TGSA preserves the env-advantage sign.
+                        teacher_log_prob = data["teacher_log_prob"]
+                        kl_tok = compute_reverse_kl_token(
+                            old_log_probs=log_prob, teacher_log_prob=teacher_log_prob,
+                            response_mask=response_mask, kl_penalty=tgsa_kl_penalty)  # (bs, L)
+                        kl_per_row = verl_F.masked_mean(kl_tok, response_mask.float(), axis=-1)  # (bs,)
+                        adv_per_row = verl_F.masked_mean(advantages, response_mask.float(), axis=-1)  # (bs,)
+                        if tgsa_kl_gate_mode == "hard":
+                            gate = (adv_per_row > 0).to(kl_per_row.dtype)
+                        else:  # soft
+                            gate = torch.sigmoid(tgsa_kl_gate_eta * adv_per_row)
+                        tgsa_kl_loss = (gate * kl_per_row).mean()
+                        policy_loss = policy_loss + tgsa_kl_loss * tgsa_kl_coef
+                        metrics["actor/tgsa_kl_loss"] = tgsa_kl_loss.detach().item()
+                        metrics["actor/tgsa_kl_coef"] = tgsa_kl_coef
+                        metrics["actor/tgsa_kl_gate_frac"] = gate.mean().detach().item()
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

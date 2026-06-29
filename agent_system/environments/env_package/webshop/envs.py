@@ -30,10 +30,93 @@ class WebshopWorker:
         # Lazy import avoids CUDA initialisation issues
         import sys
         import os
+        import glob
+        import re
+        import shutil
+        import subprocess
+
+        # ---- JVM pin (safety net for pyserini/pyjnius) ---------------------
+        # pyserini 0.17 bundles Lucene 8 (Java 8 bytecode, class version 52.0);
+        # a JVM <= Java 7 raises `UnsupportedClassVersionError: ... version 52.0`.
+        # On this box `/usr/local/java` is Java 7 and the global LD_LIBRARY_PATH
+        # puts its libjvm ahead of Java 11's, so dlopen picks Java 7. The run
+        # script already picks a Java >= 8 and propagates it via
+        # ray_init.runtime_env.env_vars; this is the in-worker safety net for
+        # when that propagation doesn't land. Must run BEFORE any pyserini
+        # import (which triggers `import jnius` -> dlopen libjvm).
+
+        def _java_major(java_bin):
+            try:
+                r = subprocess.run([java_bin, "-version"], capture_output=True, text=True, timeout=15)
+                out = r.stderr or r.stdout
+            except Exception:  # pragma: no cover - best-effort
+                return 0
+            m = re.search(r'version "(\d+)(?:\.(\d+))?', out)
+            if not m:
+                return 0
+            major = int(m.group(1))
+            if major == 1 and m.group(2):  # legacy 1.x scheme (1.7 -> 7)
+                major = int(m.group(2))
+            return major
+
+        # Scan candidates; pick the first verified Java >= 8.
+        candidates = []
+        for key in ("JAVA_HOME", "JDK_HOME"):
+            v = os.environ.get(key)
+            if v:
+                candidates.append(v.rstrip("/"))
+        for c in ("/usr/lib/jvm/java-11-openjdk-11.0.22.0.7-1.el7_9.x86_64",
+                  "/workdir/mjdk-11.0.16", "/usr/local/jdk1.8.0_45", "/usr/local/java"):
+            if c not in candidates:
+                candidates.append(c)
+
+        java_home = None
+        for cand in candidates:
+            jb = os.path.join(cand, "bin", "java")
+            if os.path.exists(jb) and _java_major(jb) >= 8:
+                java_home = cand
+                break
+        if java_home is None:
+            java_home = (os.environ.get("JAVA_HOME") or "/usr/local/java").rstrip("/")
+            print(f"[WebshopWorker] WARNING: no Java >= 8 found among {candidates}; "
+                  f"using {java_home}", flush=True)
+
+        # Pin env vars (pyjnius checks JDK_HOME before JAVA_HOME).
+        os.environ["JAVA_HOME"] = java_home
+        os.environ["JDK_HOME"] = java_home
+        os.environ["PATH"] = os.path.join(java_home, "bin") + os.pathsep + os.environ.get("PATH", "")
+        # Prepend the chosen JDK's libjvm dir so dlopen picks it up first
+        # (JDK11+: lib/server; JDK8: jre/lib/*/server).
+        jvm_dirs = [os.path.join(java_home, "lib", "server")]
+        jvm_dirs += glob.glob(os.path.join(java_home, "jre", "lib", "*", "server"))
+        new_ld = os.pathsep.join(d for d in jvm_dirs if os.path.isdir(d))
+        old_ld = os.environ.get("LD_LIBRARY_PATH")
+        if new_ld:
+            os.environ["LD_LIBRARY_PATH"] = new_ld + (os.pathsep + old_ld if old_ld else "")
+        # pyjnius starts the JVM via JNI_CreateJavaVM: ignores `_JAVA_OPTIONS`
+        # (launcher-only), honours JAVA_TOOL_OPTIONS and jnius_config.add_options.
+        if not os.environ.get("JAVA_TOOL_OPTIONS"):
+            os.environ["JAVA_TOOL_OPTIONS"] = "-Xss256k -XX:+UseSerialGC -Xmx256m -XX:-UsePerfData"
+        try:
+            import jnius_config
+            if not jnius_config.vm_running:
+                jnius_config.add_options("-Xss256k", "-XX:+UseSerialGC", "-Xmx256m", "-XX:-UsePerfData")
+        except Exception as e:  # pragma: no cover - best-effort, don't block init
+            print(f"[WebshopWorker] WARNING: jnius_config preconfigure failed ({e})", flush=True)
+
+        libjvm = "<none>"
+        for seg in (os.environ.get("LD_LIBRARY_PATH") or "").split(os.pathsep):
+            if seg and os.path.exists(os.path.join(seg, "libjvm.so")):
+                libjvm = os.path.join(seg, "libjvm.so")
+                break
+        print(f"[WebshopWorker] using JAVA_HOME={java_home} "
+              f"(java v{_java_major(os.path.join(java_home, 'bin', 'java')) or '?'}), "
+              f"libjvm={libjvm}", flush=True)
+
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), 'webshop'))
         sys.path.append(project_root)
         from web_agent_site.envs import WebAgentTextEnv  # noqa: WPS433 (runtime import)
-        
+
         env_kwargs['seed'] = seed
         self.env = gym.make('WebAgentTextEnv-v0', **env_kwargs)
     
