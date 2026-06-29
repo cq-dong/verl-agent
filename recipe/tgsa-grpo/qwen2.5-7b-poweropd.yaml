@@ -1,0 +1,44 @@
+# recipe/tgsa-grpo/qwen2.5-7b-poweropd.yaml
+# PowerOPD 启发式 TGSA-GRPO 配置
+# 对比：使用有界幂次奖励替代 log-ratio
+
+# 基础配置继承标准 TGSA-GRPO
+defaults:
+  - qwen2.5-7b  # 继承现有配置
+
+# 覆盖 algorithm 部分启用 PowerOPD
+algorithm:
+  adv_estimator: gigpo
+
+  # TGSA 配置，启用 PowerOPD
+  tgsa:
+    enabled: true
+    lambda: 0.3              # 正常组教师调制强度
+    mu: 0.1                  # 退化组兜底强度
+    gamma: 1.0               # 信号缩放
+    eps_deg: 0.01            # 退化阈值
+    normalization_mode: minmax
+    replace_step_advantage: true
+
+    # PowerOPD 新增配置
+    use_poweropd: true       # 启用 PowerOPD 模式
+    power_alpha: 5.0         # 幂次系数（越大越关注高概率token）
+
+    # 其他可选配置
+    use_margin: false        # 是否使用 margin 模式
+    delta_norm_clip: 3.0     # z-score 裁剪阈值
+
+    # 教师模型配置
+    teacher:
+      type: sglang
+      url: http://localhost:30000/generate
+      temperature: 0.7
+      top_p: 0.9
+
+# 实验标识
+experiment_name: tgsa-grpo-poweropd-qwen2.5-7b
+
+# 日志配置
+logger:
+  - tensorboard
+  - wandb

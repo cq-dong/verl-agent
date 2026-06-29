@@ -57,10 +57,16 @@ def compute_opd_advantage(old_log_probs: torch.Tensor,
                           response_length: int,
                           kl_coef: float = 1.0,
                           kl_penalty: str = "k3",
-                          out_stats: Optional[dict] = None):
-    """纯 OPD 优势:advantage = -kl_coef * KL(pi_theta || pi_T),逐 token,mask 后。
+                          out_stats: Optional[dict] = None,
+                          # PowerOPD additions:
+                          use_poweropd: bool = False,
+                          power_alpha: float = 5.0):
+    """纯 OPD 优势，支持标准 KL 或 PowerOPD 有界奖励。
 
-    忠实复刻 ROLL:
+    Standard: advantage = -kl_coef * KL(pi_theta || pi_T) using log-ratio
+    PowerOPD: advantage = -kl_coef * (π_T^α - π_θ^α) using bounded power diff
+
+    忠实复刻 ROLL (vanilla mode):
       * advantages = -total_weighted_kld   (functionals.py:1149)
       * advantages = advantages * response_mask   (functionals.py:1180)
     无环境奖励、无环境门控(全轨迹无条件蒸馏)、无 critic。
@@ -74,11 +80,37 @@ def compute_opd_advantage(old_log_probs: torch.Tensor,
         kl_penalty: KL 估计形式,"k3"(默认,与 ROLL 一致)/"kl"(k1)/"abs"/"mse"。
         out_stats: 可选 dict,填充 opd/* 统计量(供 tensorboard 侧信道 logger,
             沿用 TGSA 的 out_stats 模式)。None 时不填。
+        use_poweropd: 启用 PowerOPD 有界幂次奖励(arXiv:2606.17199)。
+        power_alpha: PowerOPD 幂次系数(默认 5.0)。
 
     Returns:
         (advantages, returns): 均为 (bs, response_length),契约与 GiGPO 的 scores
         一致,可直接写入 batch['advantages']/batch['returns'],loss 侧零改动。
     """
+    if use_poweropd:
+        # PowerOPD path: bounded power difference
+        from gigpo.poweropd import compute_power_opd_advantage
+
+        adv, ret = compute_power_opd_advantage(
+            log_prob_teacher=teacher_log_prob,
+            log_prob_student=old_log_probs,
+            response_mask=response_mask,
+            alpha=power_alpha,
+            kl_coef=kl_coef,
+            use_policy_gradient=False,  # Keep same interface as vanilla
+        )
+
+        if out_stats is not None:
+            mask = response_mask.to(device=adv.device, dtype=adv.dtype)
+            valid = mask.sum().clamp(min=1.0)
+            out_stats["opd/kl_advantage_mean"] = float((adv * mask).sum().item() / valid.item())
+            out_stats["opd/kl_coef"] = float(kl_coef)
+            out_stats["opd/poweropd_enabled"] = 1.0
+            out_stats["opd/power_alpha"] = float(power_alpha)
+
+        return adv, ret
+
+    # Original vanilla path: log-ratio based KL
     # 逐 token 的 reverse-KL 贡献(未 mask 聚合):(bs, response_length)
     # k3 = (exp(teacher - student) - (teacher - student) - 1).clamp(-10, 10)
     kl_tok = compute_reverse_kl_token(
@@ -103,6 +135,7 @@ def compute_opd_advantage(old_log_probs: torch.Tensor,
         valid = mask.sum().clamp(min=1.0)
         out_stats["opd/kl_advantage_mean"] = float((adv * mask).sum().item() / valid.item())
         out_stats["opd/kl_coef"] = float(kl_coef)
+        out_stats["opd/poweropd_enabled"] = 0.0
 
     # returns = advantages(纯 OPD 无 critic,returns 即 advantages;对齐 ROLL)。
     return adv, adv
